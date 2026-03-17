@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgforge"
+version = "0.1.1"
+description = "Pure Python Outlook .msg file builder — no COM, no Outlook required"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "j", email = "j@awarm.place"}]
+keywords = ["outlook", "msg", "email", "mapi", "cfb", "ole"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Email",
+]
+dependencies = [
+    "compressed-rtf>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "extract-msg>=0.50.0",
+    "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/awarmplace/msgforge"
+
+[tool.setuptools.packages.find]
+where = ["src"]
