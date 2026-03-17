@@ -44,14 +44,44 @@ msg = Message(
 )
 msg.attach("report.xlsx")
 msg.save("weekly_report.msg")
+
+# Inline images — reference with cid: in HTML, attach with content_id
+msg = Message(
+    subject="Product Update",
+    html_body="""
+    <p>Hi team,</p>
+    <p>Here's the new logo and sales chart:</p>
+    <img src="cid:logo" width="200">
+    <br>
+    <img src="cid:chart" width="400">
+    <p>Best regards</p>
+    """,
+    to=[("alice@example.com", "Alice")],
+)
+msg.attach("logo.png", content_id="logo")
+msg.attach("chart.png", content_id="chart")
+msg.attach("report.xlsx")  # regular attachment — shows in attachment bar
+msg.save("product_update.msg")
+
+# High importance
+msg = Message(
+    subject="Action Required",
+    text_body="Please review ASAP.",
+    to=[("bob@example.com", "Bob")],
+    importance="high",
+)
+msg.save("urgent.msg")
 ```
 
 ## Features
 
 - **HTML body** — full CSS, tables, bold/italic rendering in Outlook (via encapsulated HTML in RTF)
 - **Plain text body** — fallback when no HTML provided
+- **Inline images** — embed images in HTML via `cid:` references (hidden from attachment bar)
 - **Recipients** — TO, CC, BCC with display names
 - **File attachments** — appear in Outlook's attachment bar
+- **Importance** — `"low"`, `"normal"`, or `"high"` (shown in Outlook's priority column)
+- **Unicode support** — full Unicode in HTML bodies (smart quotes, CJK, emoji) via proper RTF Unicode escapes
 - **Pure Python** — only dependency is `compressed-rtf`
 - **Cross-platform** — works on Linux, macOS, Windows
 
@@ -67,18 +97,19 @@ Message(
     to=[("email", "Name")],  # TO recipients
     cc=[...],                # CC recipients
     bcc=[...],               # BCC recipients
+    importance="normal",     # "low", "normal", or "high"
 )
 ```
 
 Recipients can be `("email", "Name")` tuples or just `"email"` strings.
 
-### `.attach(path, filename=None)`
+### `.attach(path, filename=None, content_id=None)`
 
-Attach a file from disk. Returns `self` for chaining.
+Attach a file from disk. Returns `self` for chaining. Pass `content_id` to embed as an inline image (`<img src="cid:content_id">`).
 
-### `.attach_bytes(filename, data, mime_type=None)`
+### `.attach_bytes(filename, data, mime_type=None, content_id=None)`
 
-Attach a file from bytes. MIME type auto-detected from extension.
+Attach a file from bytes. MIME type auto-detected from extension. Pass `content_id` for inline images.
 
 ### `.save(path)`
 
@@ -92,11 +123,9 @@ Return the `.msg` file content as bytes (for web responses, etc).
 
 - **Experimental** — implements MS-CFB and MS-OXMSG from scratch; not battle-tested across all Outlook versions
 - **No read support** — this package only creates `.msg` files, it cannot read or parse them (use `extract-msg` for that)
-- **No embedded images** — inline images (`<img>` tags referencing CID attachments) are not supported
 - **No RTF body authoring** — rich text is generated from HTML only; direct RTF input is not supported
 - **No digital signatures or encryption** — messages are unsigned and unencrypted
 - **No calendar/contact/task items** — only email messages (`IPM.Note`) are supported
-- **ASCII-only RTF** — non-ASCII characters in HTML bodies are encoded as RTF escapes, which may not render correctly for all scripts
 - **Recipient resolution** — recipients show display names but may not resolve to Exchange contacts until Outlook processes them
 - **Large files** — no streaming support; the entire message is built in memory
 
@@ -113,6 +142,7 @@ Key implementation details discovered through testing:
 - Directory entry names must be sorted by **length first**, then case-insensitive (MS-CFB spec)
 - `PT_UNICODE` property sizes must include +2 bytes for the null terminator
 - HTML bodies require encapsulated HTML in RTF (`\fromhtml1`) — raw `PR_HTML` is not rendered by Outlook
+- Inline images use base64 data URIs embedded directly in the HTML before RTF encapsulation — Outlook's `\fromhtml1` renderer cannot resolve `cid:` references against the attachment table
 
 ## Running tests
 

@@ -30,6 +30,7 @@ Requires: compressed-rtf (pip install compressed-rtf)
 
 from __future__ import annotations
 
+import mimetypes
 import re
 import struct
 import time
@@ -62,6 +63,7 @@ class Message:
         to: list = None,
         cc: list = None,
         bcc: list = None,
+        importance: str = "normal",
     ):
         self.subject = subject
         self.html_body = html_body
@@ -69,14 +71,19 @@ class Message:
         self.to: List[Tuple[str, str]] = _normalize_recipients(to)
         self.cc: List[Tuple[str, str]] = _normalize_recipients(cc)
         self.bcc: List[Tuple[str, str]] = _normalize_recipients(bcc)
-        self._attachments: List[Tuple[str, bytes, str]] = []
+        self.importance = importance
+        self._attachments: List[Tuple[str, bytes, str, str | None]] = []
 
-    def attach(self, path: Union[str, Path], filename: str = None) -> Message:
+    def attach(self, path: Union[str, Path], filename: str = None,
+               content_id: str = None) -> Message:
         """Attach a file from disk.
 
         Args:
             path: Path to the file.
             filename: Override the filename shown in Outlook.
+            content_id: Content-ID for inline images (reference in HTML
+                as ``<img src="cid:content_id">``). When set, the
+                attachment is hidden from Outlook's attachment bar.
 
         Returns:
             self (for chaining).
@@ -86,41 +93,55 @@ class Message:
             filename or path.name,
             path.read_bytes(),
             _guess_mime(path.name),
+            content_id,
         ))
         return self
 
     def attach_bytes(self, filename: str, data: bytes,
-                     mime_type: str = None) -> Message:
+                     mime_type: str = None,
+                     content_id: str = None) -> Message:
         """Attach a file from bytes.
 
         Args:
             filename: Filename shown in Outlook.
             data: Raw file content.
             mime_type: MIME type (auto-detected from extension if omitted).
+            content_id: Content-ID for inline images (reference in HTML
+                as ``<img src="cid:content_id">``). When set, the
+                attachment is hidden from Outlook's attachment bar.
 
         Returns:
             self (for chaining).
         """
-        self._attachments.append((filename, data, mime_type or _guess_mime(filename)))
+        self._attachments.append((
+            filename, data, mime_type or _guess_mime(filename), content_id,
+        ))
         return self
 
     def save(self, path: Union[str, Path]) -> None:
         """Save the message as an Outlook .msg file."""
-        _build_msg(self, path)
+        Path(path).write_bytes(_build_msg(self))
 
     def as_bytes(self) -> bytes:
         """Return the .msg file content as bytes."""
-        import io
-        buf = io.BytesIO()
-        # Write to a temp path then read back
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.msg', delete=False) as f:
-            tmp = f.name
-        try:
-            _build_msg(self, tmp)
-            return Path(tmp).read_bytes()
-        finally:
-            Path(tmp).unlink(missing_ok=True)
+        return _build_msg(self)
+
+    def __repr__(self) -> str:
+        to_str = ", ".join(e for e, _ in self.to)
+        parts = [f"subject={self.subject!r}"]
+        if to_str:
+            parts.append(f"to={to_str!r}")
+        if self.cc:
+            parts.append(f"cc={', '.join(e for e, _ in self.cc)!r}")
+        if self.bcc:
+            parts.append(f"bcc={', '.join(e for e, _ in self.bcc)!r}")
+        body = "html" if self.html_body else "text" if self.text_body else "empty"
+        parts.append(f"body={body!r}")
+        if self.importance != "normal":
+            parts.append(f"importance={self.importance!r}")
+        if self._attachments:
+            parts.append(f"attachments={len(self._attachments)}")
+        return f"Message({', '.join(parts)})"
 
 
 # ─── Recipient helpers ───────────────────────────────────────────────────────
@@ -176,6 +197,12 @@ _MAPI_TO = 1
 _MAPI_CC = 2
 _MAPI_BCC = 3
 
+_IMPORTANCE_MAP = {
+    "low":    (0, -1),   # IMPORTANCE_LOW,  PRIO_NONURGENT
+    "normal": (1,  0),   # IMPORTANCE_NORMAL, PRIO_NORMAL
+    "high":   (2,  1),   # IMPORTANCE_HIGH, PRIO_URGENT
+}
+
 
 # ─── OLE Writer (internal) ──────────────────────────────────────────────────
 
@@ -216,7 +243,8 @@ class _OleWriter:
         parent.children.append(entry)
         return entry
 
-    def write(self, path: Union[str, Path]) -> None:
+    def build(self) -> bytes:
+        """Build the OLE compound file and return as bytes."""
         entries = self._flatten_sorted()
 
         large = [e for e in entries if e.entry_type == _STGTY_STREAM and e.data
@@ -322,8 +350,11 @@ class _OleWriter:
             soff = mini_off + e._start_sector * _MINI_SECTOR_SIZE
             buf[soff:soff + len(e.data)] = e.data
 
-        with open(path, 'wb') as f:
-            f.write(buf)
+        return bytes(buf)
+
+    def write(self, path: Union[str, Path]) -> None:
+        """Build and write the OLE compound file to disk."""
+        Path(path).write_bytes(self.build())
 
     def _flatten_sorted(self) -> List[_DirEntry]:
         pairs: List[Tuple[str, _DirEntry]] = []
@@ -478,8 +509,8 @@ class _Props:
 
 # ─── MSG builder (internal) ─────────────────────────────────────────────────
 
-def _build_msg(msg: Message, path: Union[str, Path]) -> None:
-    """Build the .msg file from a Message object."""
+def _build_msg(msg: Message) -> bytes:
+    """Build the .msg file and return as bytes."""
     ole = _OleWriter()
     root = ole.root
     root.clsid = _MSG_CLSID
@@ -502,9 +533,13 @@ def _build_msg(msg: Message, path: Union[str, Path]) -> None:
     mp.add_unicode(ole, root, 0x003D, "")                # SubjectPrefix
     mp.add_unicode(ole, root, 0x0070, msg.subject or "") # ConversationTopic
 
+    has_inline = any(cid for _, _, _, cid in msg._attachments)
     if msg.html_body:
         import compressed_rtf
-        rtf_bytes = _encapsulate_html(msg.html_body)
+        html = msg.html_body
+        if has_inline:
+            html = _inline_cid_images(html, msg._attachments)
+        rtf_bytes = _encapsulate_html(html)
         mp.add_binary(ole, root, 0x1009, compressed_rtf.compress(rtf_bytes))
         mp.add_boolean(0x0E1F, True)  # RTF_IN_SYNC
         mp.add_unicode(ole, root, 0x1000,
@@ -527,8 +562,9 @@ def _build_msg(msg: Message, path: Union[str, Path]) -> None:
     mp.add_long(0x340D, 0x00040000)      # StoreSupportMask: STORE_UNICODE_OK
     mp.add_long(0x3FDE, 65001)           # InternetCodepage: UTF-8
     mp.add_long(0x3FF1, 0x0409)          # MessageLocaleId: en-US
-    mp.add_long(0x0017, 1)               # Importance: normal
-    mp.add_long(0x0026, 0)               # Priority: none
+    imp, prio = _IMPORTANCE_MAP.get(msg.importance, (1, 0))
+    mp.add_long(0x0017, imp)             # Importance
+    mp.add_long(0x0026, prio)            # Priority
     mp.add_long(0x0036, 0)               # Sensitivity: none
     if msg._attachments:
         mp.add_boolean(0x0E1B, True)     # HasAttach
@@ -555,7 +591,7 @@ def _build_msg(msg: Message, path: Union[str, Path]) -> None:
         ole.add_stream(stor, "__properties_version1.0", rp.build_sub_stream())
 
     # Attachments
-    for i, (filename, data, mime_type) in enumerate(msg._attachments):
+    for i, (filename, data, mime_type, content_id) in enumerate(msg._attachments):
         stor = ole.add_storage(root, f"__attach_version1.0_#{i:08X}")
         ap = _Props()
         ext = Path(filename).suffix
@@ -564,7 +600,13 @@ def _build_msg(msg: Message, path: Union[str, Path]) -> None:
         ap.add_long(0x0FFE, 7)                  # ObjectType: MAPI_ATTACH
         ap.add_long(0x3705, 1)                  # AttachMethod: BY_VALUE
         ap.add_long(0x370B, 0xFFFFFFFF)         # RenderingPosition: not inline
-        ap.add_long(0x3714, 0)                  # AttachFlags: normal
+        if content_id:
+            ap.add_long(0x3714, 4)              # AttachFlags: ATT_MHTML_REF
+            ap.add_unicode(ole, stor, 0x3712, content_id)   # AttachContentId
+            ap.add_unicode(ole, stor, 0x3716, "inline")     # AttachDisposition
+            ap.add_boolean(0x7FFE, True)        # AttachmentHidden
+        else:
+            ap.add_long(0x3714, 0)              # AttachFlags: normal
         ap.add_unicode(ole, stor, 0x3704, short_name)   # AttachFilename
         ap.add_unicode(ole, stor, 0x3707, filename)     # AttachLongFilename
         ap.add_unicode(ole, stor, 0x3703, ext)          # AttachExtension
@@ -574,7 +616,7 @@ def _build_msg(msg: Message, path: Union[str, Path]) -> None:
             ap.add_unicode(ole, stor, 0x370E, mime_type)  # AttachMimeTag
         ole.add_stream(stor, "__properties_version1.0", ap.build_sub_stream())
 
-    ole.write(path)
+    return ole.build()
 
 
 # ─── HTML / RTF helpers (internal) ──────────────────────────────────────────
@@ -586,18 +628,17 @@ def _encapsulate_html(html_str: str) -> bytes:
     wrapped in {\\*\\htmltag} groups inside an RTF document. Outlook
     renders it as full HTML with CSS, tables, etc.
     """
-    _ = chr(92)
-    out = ['{' + _ + 'rtf1' + _ + 'ansi' + _ + 'ansicpg1252' + _ + 'fromhtml1 '
-           + _ + 'deff0{' + _ + 'fonttbl{' + _ + 'f0' + _ + 'fswiss Arial;}}'
-           + _ + 'uc1' + _ + 'pard' + _ + 'plain' + _ + 'deftab360 '
-           + _ + 'f0' + _ + 'fs24 ']
+    out = ['{\\rtf1\\ansi\\ansicpg1252\\fromhtml1 '
+           '\\deff0{\\fonttbl{\\f0\\fswiss Arial;}}'
+           '\\uc1\\pard\\plain\\deftab360 '
+           '\\f0\\fs24 ']
 
     for part in re.split(r'(<[^>]+>)', html_str):
         if not part:
             continue
         encoded = _rtf_encode(part)
         if part.startswith('<'):
-            out.append('{' + _ + '*' + _ + 'htmltag ' + encoded + '}')
+            out.append('{\\*\\htmltag ' + encoded + '}')
         elif encoded.strip():
             out.append(encoded)
 
@@ -606,18 +647,35 @@ def _encapsulate_html(html_str: str) -> bytes:
 
 
 def _rtf_encode(text: str) -> str:
-    """Encode text for RTF, escaping special chars and non-ASCII."""
-    _ = chr(92)
+    """Encode text for RTF, escaping special chars and non-ASCII.
+
+    Characters 0x80-0xFF use RTF hex escapes (\\'XX).
+    Characters above U+00FF use RTF Unicode escapes (\\uN?) with signed
+    16-bit code points. Supplementary plane characters (above U+FFFF) are
+    encoded as UTF-16 surrogate pairs.
+    """
     out = []
     for ch in text:
+        cp = ord(ch)
         if ch == '\\':
-            out.append(_ + _)
+            out.append('\\\\')
         elif ch == '{':
-            out.append(_ + '{')
+            out.append('\\{')
         elif ch == '}':
-            out.append(_ + '}')
-        elif ord(ch) > 127:
-            out.append(_ + "'" + format(ord(ch) & 0xFF, '02x'))
+            out.append('\\}')
+        elif cp > 0xFFFF:
+            hi = 0xD800 + ((cp - 0x10000) >> 10)
+            lo = 0xDC00 + ((cp - 0x10000) & 0x3FF)
+            if hi > 32767:
+                hi -= 65536
+            if lo > 32767:
+                lo -= 65536
+            out.append(f'\\u{hi}?\\u{lo}?')
+        elif cp > 0xFF:
+            signed = cp if cp <= 32767 else cp - 65536
+            out.append(f'\\u{signed}?')
+        elif cp > 127:
+            out.append(f"\\'{cp:02x}")
         else:
             out.append(ch)
     return ''.join(out)
@@ -639,16 +697,19 @@ def _filetime_now() -> int:
     return int((time.time() + 11644473600) * 10_000_000)
 
 
+def _inline_cid_images(html: str, attachments) -> str:
+    """Replace cid: references with base64 data URIs."""
+    import base64
+    for filename, data, mime_type, content_id in attachments:
+        if content_id:
+            b64 = base64.b64encode(data).decode('ascii')
+            html = html.replace(
+                f'cid:{content_id}',
+                f'data:{mime_type};base64,{b64}',
+            )
+    return html
+
+
 def _guess_mime(filename: str) -> str:
-    return {
-        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        '.xls': 'application/vnd.ms-excel',
-        '.pdf': 'application/pdf',
-        '.csv': 'text/csv',
-        '.txt': 'text/plain',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.zip': 'application/zip',
-        '.doc': 'application/msword',
-        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    }.get(Path(filename).suffix.lower(), 'application/octet-stream')
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or 'application/octet-stream'

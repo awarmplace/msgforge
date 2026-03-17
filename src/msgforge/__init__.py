@@ -16,7 +16,13 @@ Usage::
     msg.save("Q1 Report.msg")
 """
 
+from importlib.metadata import version, PackageNotFoundError
+
 from ._builder import Message
 
-__all__ = ["Message"]
-__version__ = "0.1.1"
+__all__ = ["Message", "__version__"]
+
+try:
+    __version__ = version("msgforge")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
