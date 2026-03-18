@@ -63,6 +63,15 @@ msg.attach("chart.png", content_id="chart")
 msg.attach("report.xlsx")  # regular attachment — shows in attachment bar
 msg.save("product_update.msg")
 
+# Set sender (e.g. shared mailbox)
+msg = Message(
+    subject="From Shared Mailbox",
+    text_body="Sent on behalf of the team.",
+    to=[("bob@example.com", "Bob")],
+    sender=("shared@company.com", "Shared Mailbox"),
+)
+msg.save("shared.msg")
+
 # High importance
 msg = Message(
     subject="Action Required",
@@ -80,6 +89,7 @@ msg.save("urgent.msg")
 - **Inline images** — embed images in HTML via `cid:` references (hidden from attachment bar)
 - **Recipients** — TO, CC, BCC with display names
 - **File attachments** — appear in Outlook's attachment bar
+- **Sender** — optional From address (e.g. shared mailboxes, delegation)
 - **Importance** — `"low"`, `"normal"`, or `"high"` (shown in Outlook's priority column)
 - **Unicode support** — full Unicode in HTML bodies (smart quotes, CJK, emoji) via proper RTF Unicode escapes
 - **Pure Python** — only dependency is `compressed-rtf`
@@ -98,6 +108,7 @@ Message(
     cc=[...],                # CC recipients
     bcc=[...],               # BCC recipients
     importance="normal",     # "low", "normal", or "high"
+    sender=("email", "Name"),  # optional From address
 )
 ```
 

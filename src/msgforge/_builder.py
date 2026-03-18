@@ -53,6 +53,8 @@ class Message:
             The display name is optional: ``"email"`` alone also works.
         cc: List of CC recipients (same format as ``to``).
         bcc: List of BCC recipients (same format as ``to``).
+        sender: Optional sender as ``("email", "Display Name")`` or ``"email"``.
+            Sets the From field. If omitted, Outlook uses the sending account.
     """
 
     def __init__(
@@ -64,6 +66,7 @@ class Message:
         cc: list = None,
         bcc: list = None,
         importance: str = "normal",
+        sender: Union[str, Tuple[str, str], None] = None,
     ):
         self.subject = subject
         self.html_body = html_body
@@ -72,6 +75,7 @@ class Message:
         self.cc: List[Tuple[str, str]] = _normalize_recipients(cc)
         self.bcc: List[Tuple[str, str]] = _normalize_recipients(bcc)
         self.importance = importance
+        self.sender: Tuple[str, str] | None = _normalize_sender(sender)
         self._attachments: List[Tuple[str, bytes, str, str | None]] = []
 
     def attach(self, path: Union[str, Path], filename: str = None,
@@ -161,6 +165,19 @@ def _normalize_recipients(recipients) -> List[Tuple[str, str]]:
         else:
             result.append((str(r), str(r)))
     return result
+
+
+def _normalize_sender(sender) -> Tuple[str, str] | None:
+    """Normalize sender to (email, display_name) or None."""
+    if sender is None:
+        return None
+    if isinstance(sender, str):
+        return (sender, sender)
+    if isinstance(sender, (tuple, list)) and len(sender) >= 2:
+        return (sender[0], sender[1])
+    if isinstance(sender, (tuple, list)) and len(sender) == 1:
+        return (sender[0], sender[0])
+    return (str(sender), str(sender))
 
 
 # ─── OLE Compound File constants (MS-CFB) ───────────────────────────────────
@@ -557,6 +574,18 @@ def _build_msg(msg: Message) -> bytes:
         mp.add_unicode(ole, root, 0x0E03, cc_display)
     if bcc_display:
         mp.add_unicode(ole, root, 0x0E02, bcc_display)
+
+    # Sender properties
+    if msg.sender:
+        s_email, s_name = msg.sender
+        mp.add_unicode(ole, root, 0x0C1A, s_name)   # SenderName
+        mp.add_unicode(ole, root, 0x0C1E, "SMTP")    # SenderAddrType
+        mp.add_unicode(ole, root, 0x0C1F, s_email)   # SenderEmailAddress
+        mp.add_unicode(ole, root, 0x5D01, s_email)   # SenderSmtpAddress
+        mp.add_unicode(ole, root, 0x0042, s_name)     # SentRepresentingName
+        mp.add_unicode(ole, root, 0x0044, "SMTP")     # SentRepresentingAddrType
+        mp.add_unicode(ole, root, 0x0045, s_email)    # SentRepresentingEmailAddress
+        mp.add_unicode(ole, root, 0x5D02, s_email)    # SentRepresentingSmtpAddress
 
     flags = 0x08  # MSGFLAG_UNSENT
     if msg._attachments:
