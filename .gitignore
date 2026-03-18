@@ -6,3 +6,4 @@ build/
 *.msg
 *.pdf
 .pytest_cache/
+.claude/
