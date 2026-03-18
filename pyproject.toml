@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msgforge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pure Python Outlook .msg file builder — no COM, no Outlook required"
 readme = "README.md"
 requires-python = ">=3.9"

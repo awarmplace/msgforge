@@ -427,7 +427,7 @@ class _OleWriter:
         buf[off + len(name_bytes) + 1] = 0
         struct.pack_into('<H', buf, off + 64, len(name_bytes) + 2)
         buf[off + 66] = entry.entry_type
-        buf[off + 67] = _RED if entry.entry_type == _STGTY_ROOT else entry._color
+        buf[off + 67] = _BLACK if entry.entry_type == _STGTY_ROOT else entry._color
         struct.pack_into('<I', buf, off + 68, entry._left_id & 0xFFFFFFFF)
         struct.pack_into('<I', buf, off + 72, entry._right_id & 0xFFFFFFFF)
         struct.pack_into('<I', buf, off + 76, entry._child_id & 0xFFFFFFFF)
@@ -529,9 +529,9 @@ def _build_msg(msg: Message) -> bytes:
     # Message properties
     mp = _Props()
     mp.add_unicode(ole, root, 0x001A, "IPM.Note")       # MessageClass
-    mp.add_unicode(ole, root, 0x0037, msg.subject or "") # Subject
-    mp.add_unicode(ole, root, 0x003D, "")                # SubjectPrefix
-    mp.add_unicode(ole, root, 0x0070, msg.subject or "") # ConversationTopic
+    if msg.subject:
+        mp.add_unicode(ole, root, 0x0037, msg.subject)  # Subject
+        mp.add_unicode(ole, root, 0x0070, msg.subject)  # ConversationTopic
 
     has_inline = any(cid for _, _, _, cid in msg._attachments)
     if msg.html_body:
@@ -547,13 +547,16 @@ def _build_msg(msg: Message) -> bytes:
     elif msg.text_body:
         mp.add_unicode(ole, root, 0x1000, msg.text_body)
 
-    # Display headers (always include, even if empty)
-    mp.add_unicode(ole, root, 0x0E04,
-                   "; ".join(n for _, n, t in all_recip if t == _MAPI_TO))
-    mp.add_unicode(ole, root, 0x0E03,
-                   "; ".join(n for _, n, t in all_recip if t == _MAPI_CC))
-    mp.add_unicode(ole, root, 0x0E02,
-                   "; ".join(n for _, n, t in all_recip if t == _MAPI_BCC))
+    # Display headers (skip if empty — spec forbids zero-length PtypString)
+    to_display = "; ".join(n for _, n, t in all_recip if t == _MAPI_TO)
+    cc_display = "; ".join(n for _, n, t in all_recip if t == _MAPI_CC)
+    bcc_display = "; ".join(n for _, n, t in all_recip if t == _MAPI_BCC)
+    if to_display:
+        mp.add_unicode(ole, root, 0x0E04, to_display)
+    if cc_display:
+        mp.add_unicode(ole, root, 0x0E03, cc_display)
+    if bcc_display:
+        mp.add_unicode(ole, root, 0x0E02, bcc_display)
 
     flags = 0x08  # MSGFLAG_UNSENT
     if msg._attachments:
