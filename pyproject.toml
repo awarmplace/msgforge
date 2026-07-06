@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msgforge"
-version = "0.2.1"
+version = "1.0.0"
 description = "Pure Python Outlook .msg file builder — no COM, no Outlook required"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ license = {file = "LICENSE"}
 authors = [{name = "j", email = "j@awarm.place"}]
 keywords = ["outlook", "msg", "email", "mapi", "cfb", "ole"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -26,7 +26,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "extract-msg>=0.50.0",
+    "olefile>=0.46",
     "pytest>=7.0",
+    "ruff>=0.4",
 ]
 
 [project.urls]
@@ -34,3 +36,13 @@ Homepage = "https://github.com/awarmplace/msgforge"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "UP006", "UP035",  # keep typing.List/Tuple etc. while supporting 3.9
+]

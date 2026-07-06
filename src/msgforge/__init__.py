@@ -16,7 +16,7 @@ Usage::
     msg.save("Q1 Report.msg")
 """
 
-from importlib.metadata import version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, version
 
 from ._builder import Message
 

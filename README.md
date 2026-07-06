@@ -2,7 +2,7 @@
 
 Pure Python Outlook `.msg` file builder. No COM, no Outlook installation, no native dependencies. Works on Linux.
 
-> **Experimental** — this package implements the MS-CFB and MS-OXMSG specs from scratch. It has been tested with Outlook on Windows but may not cover all edge cases. Use at your own risk.
+> Implements the MS-CFB and MS-OXMSG specs from scratch. Output is validated against strict OLE parsers and round-tripped through `extract-msg` in CI, and has been tested with Outlook on Windows — but if you hit an edge case, please open an issue.
 
 ## Install
 
@@ -71,17 +71,33 @@ msg = Message(
     importance="high",
 )
 msg.save("urgent.msg")
+
+# Sent/received message with a From address (e.g. for archival or export)
+from datetime import datetime
+
+msg = Message(
+    subject="Meeting notes",
+    text_body="Notes attached.",
+    sender=("boss@corp.example", "The Boss"),
+    to=[("alice@example.com", "Alice")],
+    sent=datetime(2026, 7, 1, 12, 0),  # or sent=True for "now"
+)
+msg.save("archived.msg")
 ```
 
 ## Features
 
-- **HTML body** — full CSS, tables, bold/italic rendering in Outlook (via encapsulated HTML in RTF)
+- **HTML body** — full CSS, tables, bold/italic rendering in Outlook (via encapsulated HTML in RTF); the raw HTML is also stored in `PidTagHtml` for non-Outlook readers
 - **Plain text body** — fallback when no HTML provided
 - **Inline images** — embed images in HTML via `cid:` references (hidden from attachment bar)
+- **Sender** — set the From address for archival/export use cases
+- **Sent or draft** — messages are unsent drafts by default (open in compose mode); pass `sent=` to mark them sent/received with a timestamp
 - **Recipients** — TO, CC, BCC with display names
-- **File attachments** — appear in Outlook's attachment bar
+- **File attachments** — appear in Outlook's attachment bar; large attachments supported (DIFAT)
 - **Importance** — `"low"`, `"normal"`, or `"high"` (shown in Outlook's priority column)
 - **Unicode support** — full Unicode in HTML bodies (smart quotes, CJK, emoji) via proper RTF Unicode escapes
+- **Deterministic output** — the same message always produces the same bytes
+- **Typed** — accurate type hints, ships `py.typed`
 - **Pure Python** — only dependency is `compressed-rtf`
 - **Cross-platform** — works on Linux, macOS, Windows
 
@@ -98,10 +114,12 @@ Message(
     cc=[...],                # CC recipients
     bcc=[...],               # BCC recipients
     importance="normal",     # "low", "normal", or "high"
+    sender=("email", "Name"),# From address (optional)
+    sent=False,              # False = unsent draft; True or a datetime = sent/received
 )
 ```
 
-Recipients can be `("email", "Name")` tuples or just `"email"` strings.
+Recipients (and `sender`) can be `("email", "Name")` tuples or just `"email"` strings.
 
 ### `.attach(path, filename=None, content_id=None)`
 
@@ -121,13 +139,13 @@ Return the `.msg` file content as bytes (for web responses, etc).
 
 ## Limitations
 
-- **Experimental** — implements MS-CFB and MS-OXMSG from scratch; not battle-tested across all Outlook versions
 - **No read support** — this package only creates `.msg` files, it cannot read or parse them (use `extract-msg` for that)
 - **No RTF body authoring** — rich text is generated from HTML only; direct RTF input is not supported
 - **No digital signatures or encryption** — messages are unsigned and unencrypted
 - **No calendar/contact/task items** — only email messages (`IPM.Note`) are supported
 - **Recipient resolution** — recipients show display names but may not resolve to Exchange contacts until Outlook processes them
-- **Large files** — no streaming support; the entire message is built in memory
+- **No streaming** — the entire message is built in memory (large attachments work, but need RAM proportional to their size)
+- **`<pre>` blocks** — whitespace inside HTML is collapsed per normal HTML semantics, so preformatted text is not preserved exactly
 
 ## How it works
 
@@ -141,8 +159,10 @@ HTML bodies use the `\fromhtml1` encapsulated HTML format, the same format Outlo
 Key implementation details discovered through testing:
 - Directory entry names must be sorted by **length first**, then case-insensitive (MS-CFB spec)
 - `PT_UNICODE` property sizes must include +2 bytes for the null terminator
-- HTML bodies require encapsulated HTML in RTF (`\fromhtml1`) — raw `PR_HTML` is not rendered by Outlook
+- HTML bodies require encapsulated HTML in RTF (`\fromhtml1`) — raw `PR_HTML` is not rendered by Outlook (it is still written for non-Outlook consumers)
 - Inline images use base64 data URIs embedded directly in the HTML before RTF encapsulation — Outlook's `\fromhtml1` renderer cannot resolve `cid:` references against the attachment table
+- Files larger than ~7 MB need DIFAT sectors: the CFB header only holds 109 FAT sector pointers
+- RTF readers ignore raw newlines, so whitespace in HTML must be normalized to explicit spaces before encapsulation
 
 ## Running tests
 

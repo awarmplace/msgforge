@@ -1,7 +1,8 @@
 """Tests for msgforge — verify with extract-msg."""
 
-from msgforge import Message
 import extract_msg
+
+from msgforge import Message
 
 
 def test_plain_text(tmp_path):
@@ -220,3 +221,140 @@ def test_as_bytes(tmp_path):
     m = extract_msg.Message(str(path))
     assert m.subject == "Bytes Test"
     m.close()
+
+
+# ─── Regression & feature tests (0.3.0) ─────────────────────────────────────
+
+def test_large_attachment_difat(tmp_path):
+    """Files over ~7MB need DIFAT sectors; must survive strict OLE validation."""
+    import olefile
+    path = tmp_path / "test_big.msg"
+    payload = b"\xAB" * (8 * 1024 * 1024)
+    msg = Message(subject="Big", text_body="x", to=["user@example.com"])
+    msg.attach_bytes("big.bin", payload)
+    msg.save(path)
+
+    ole = olefile.OleFileIO(str(path))  # validates FAT/DIFAT integrity
+    ole.close()
+    m = extract_msg.Message(str(path))
+    assert m.attachments[0].data == payload
+    m.close()
+
+
+def test_whitespace_between_tags():
+    """A space separating two tags must survive RTF encapsulation."""
+    from msgforge._builder import _encapsulate_html
+    rtf = _encapsulate_html('<b>bold</b> <i>italic</i>').decode()
+    assert r'{\*\htmltag </b>} {\*\htmltag <i>}' in rtf
+
+
+def test_newlines_in_text_become_spaces():
+    """RTF readers ignore raw newlines — they must be converted to spaces."""
+    from msgforge._builder import _encapsulate_html
+    rtf = _encapsulate_html('<p>line one\nline two</p>').decode()
+    assert 'line one line two' in rtf
+
+
+def test_sender(tmp_path):
+    path = tmp_path / "test_sender.msg"
+    msg = Message(
+        subject="From Me",
+        text_body="Hello",
+        to=["user@example.com"],
+        sender=("boss@corp.example", "The Boss"),
+    )
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert "boss@corp.example" in m.sender
+    assert "The Boss" in m.sender
+    m.close()
+
+
+def test_sent_with_datetime(tmp_path):
+    from datetime import datetime
+    path = tmp_path / "test_sent.msg"
+    msg = Message(
+        subject="Sent Mail",
+        text_body="Hello",
+        to=["user@example.com"],
+        sent=datetime(2026, 7, 1, 12, 0, 0),
+    )
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert m.date is not None
+    assert m.date.year == 2026 and m.date.month == 7 and m.date.day == 1
+    m.close()
+
+
+def test_html_body_property(tmp_path):
+    """PidTagHtml (0x1013) should carry the raw HTML for non-Outlook readers."""
+    path = tmp_path / "test_htmlprop.msg"
+    html = "<p>hello <b>world</b></p>"
+    msg = Message(subject="H", html_body=html, to=["user@example.com"])
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert m.htmlBody == html.encode("utf-8")
+    m.close()
+
+
+def test_invalid_importance_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        Message(importance="urgent")
+
+
+def test_attachment_without_extension(tmp_path):
+    path = tmp_path / "test_noext.msg"
+    msg = Message(subject="NX", text_body="x", to=["user@example.com"])
+    msg.attach_bytes("Makefile", b"all: build")
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert m.attachments[0].data == b"all: build"
+    m.close()
+
+
+def test_deterministic_output():
+    def build():
+        msg = Message(subject="Same", html_body="<p>x</p>", to=["user@example.com"])
+        msg.attach_bytes("a.txt", b"data")
+        return msg.as_bytes()
+    assert build() == build()
+
+
+def test_style_stripped_from_text_fallback(tmp_path):
+    path = tmp_path / "test_style.msg"
+    msg = Message(
+        subject="Styled",
+        html_body="<html><head><style>p { color: red; }</style></head>"
+                  "<body><p>Visible</p></body></html>",
+        to=["user@example.com"],
+    )
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert "Visible" in m.body
+    assert "color" not in m.body
+    m.close()
+
+
+def test_empty_display_name_falls_back_to_email(tmp_path):
+    path = tmp_path / "test_emptyname.msg"
+    msg = Message(subject="E", text_body="x", to=[("user@example.com", "")])
+    msg.save(path)
+
+    m = extract_msg.Message(str(path))
+    assert "user@example.com" in m.to
+    m.close()
+
+
+def test_attach_filename_override_mime(tmp_path):
+    """MIME type should be guessed from the effective (overridden) filename."""
+    src = tmp_path / "data.bin"
+    src.write_bytes(b"\x89PNG fake")
+    msg = Message(subject="M", text_body="x", to=["user@example.com"])
+    msg.attach(src, filename="image.png")
+    assert msg._attachments[0][2] == "image/png"

@@ -30,14 +30,18 @@ Requires: compressed-rtf (pip install compressed-rtf)
 
 from __future__ import annotations
 
+import html as html_mod
 import mimetypes
 import re
 import struct
 import time
-import html as html_mod
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Sequence, Tuple, Union
+
+#: A recipient: either ``"email"`` or ``("email", "Display Name")``.
+Recipient = Union[str, Tuple[str, str]]
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
@@ -53,6 +57,12 @@ class Message:
             The display name is optional: ``"email"`` alone also works.
         cc: List of CC recipients (same format as ``to``).
         bcc: List of BCC recipients (same format as ``to``).
+        importance: ``"low"``, ``"normal"``, or ``"high"``.
+        sender: The From address, same format as a recipient.
+        sent: If falsy (default), the message is an unsent draft (opens in
+            compose mode in Outlook). Pass ``True`` to mark it as sent/received,
+            or a :class:`datetime.datetime` to also set the sent/received time
+            (naive datetimes are interpreted in local time).
     """
 
     def __init__(
@@ -60,11 +70,17 @@ class Message:
         subject: str = "",
         html_body: str = "",
         text_body: str = "",
-        to: list = None,
-        cc: list = None,
-        bcc: list = None,
+        to: Sequence[Recipient] | None = None,
+        cc: Sequence[Recipient] | None = None,
+        bcc: Sequence[Recipient] | None = None,
         importance: str = "normal",
+        sender: Recipient | None = None,
+        sent: bool | datetime = False,
     ):
+        if importance not in _IMPORTANCE_MAP:
+            raise ValueError(
+                f"importance must be one of {sorted(_IMPORTANCE_MAP)}, "
+                f"got {importance!r}")
         self.subject = subject
         self.html_body = html_body
         self.text_body = text_body
@@ -72,10 +88,12 @@ class Message:
         self.cc: List[Tuple[str, str]] = _normalize_recipients(cc)
         self.bcc: List[Tuple[str, str]] = _normalize_recipients(bcc)
         self.importance = importance
+        self.sender: Recipient | None = sender
+        self.sent: bool | datetime = sent
         self._attachments: List[Tuple[str, bytes, str, str | None]] = []
 
-    def attach(self, path: Union[str, Path], filename: str = None,
-               content_id: str = None) -> Message:
+    def attach(self, path: str | Path, filename: str | None = None,
+               content_id: str | None = None) -> Message:
         """Attach a file from disk.
 
         Args:
@@ -89,17 +107,18 @@ class Message:
             self (for chaining).
         """
         path = Path(path)
+        name = filename or path.name
         self._attachments.append((
-            filename or path.name,
+            name,
             path.read_bytes(),
-            _guess_mime(path.name),
+            _guess_mime(name),
             content_id,
         ))
         return self
 
     def attach_bytes(self, filename: str, data: bytes,
-                     mime_type: str = None,
-                     content_id: str = None) -> Message:
+                     mime_type: str | None = None,
+                     content_id: str | None = None) -> Message:
         """Attach a file from bytes.
 
         Args:
@@ -118,7 +137,7 @@ class Message:
         ))
         return self
 
-    def save(self, path: Union[str, Path]) -> None:
+    def save(self, path: str | Path) -> None:
         """Save the message as an Outlook .msg file."""
         Path(path).write_bytes(_build_msg(self))
 
@@ -129,6 +148,9 @@ class Message:
     def __repr__(self) -> str:
         to_str = ", ".join(e for e, _ in self.to)
         parts = [f"subject={self.subject!r}"]
+        if self.sender:
+            sender_email = self.sender if isinstance(self.sender, str) else self.sender[0]
+            parts.append(f"sender={sender_email!r}")
         if to_str:
             parts.append(f"to={to_str!r}")
         if self.cc:
@@ -155,7 +177,7 @@ def _normalize_recipients(recipients) -> List[Tuple[str, str]]:
         if isinstance(r, str):
             result.append((r, r))
         elif isinstance(r, (tuple, list)) and len(r) >= 2:
-            result.append((r[0], r[1]))
+            result.append((r[0], r[1] or r[0]))
         elif isinstance(r, (tuple, list)) and len(r) == 1:
             result.append((r[0], r[0]))
         else:
@@ -172,9 +194,12 @@ _MINI_STREAM_CUTOFF = 0x1000
 _FREESECT = 0xFFFFFFFF
 _ENDOFCHAIN = 0xFFFFFFFE
 _FATSECT = 0xFFFFFFFD
+_DIFSECT = 0xFFFFFFFC
 _NOSTREAM = 0xFFFFFFFF
 _DIR_ENTRY_SIZE = 128
 _ENTRIES_PER_FAT_SECTOR = _SECTOR_SIZE // 4
+_DIFAT_HEADER_ENTRIES = 109              # FAT sector slots in the header
+_ENTRIES_PER_DIFAT_SECTOR = _ENTRIES_PER_FAT_SECTOR - 1  # last slot chains to next DIFAT sector
 
 _STGTY_STORAGE = 1
 _STGTY_STREAM = 2
@@ -191,6 +216,7 @@ _MSG_CLSID = bytes([
 
 _PT_LONG = 0x0003
 _PT_BOOLEAN = 0x000B
+_PT_SYSTIME = 0x0040
 _PT_UNICODE = 0x001F
 _PT_BINARY = 0x0102
 _MAPI_TO = 1
@@ -258,19 +284,29 @@ class _OleWriter:
         mfat_cnt = (mini_size + 127) >> 7
         mini_container_cnt = (mini_size + 7) >> 3
 
+        # FAT/DIFAT sizing. Every sector in the file (including FAT and DIFAT
+        # sectors themselves) needs a FAT entry, and FAT sectors beyond the
+        # 109 header slots need DIFAT sectors — iterate to a fixed point.
         fat_base = fat_size + dir_cnt + mfat_cnt + mini_container_cnt
-        fat_cnt = 0
+        fat_cnt = difat_cnt = 0
         while True:
-            needed = (fat_base + fat_cnt + _ENTRIES_PER_FAT_SECTOR - 1) >> 7
-            if needed <= fat_cnt:
+            total = fat_base + fat_cnt + difat_cnt
+            need_fat = (total + _ENTRIES_PER_FAT_SECTOR - 1) >> 7
+            need_difat = (0 if need_fat <= _DIFAT_HEADER_ENTRIES else
+                          (need_fat - _DIFAT_HEADER_ENTRIES
+                           + _ENTRIES_PER_DIFAT_SECTOR - 1)
+                          // _ENTRIES_PER_DIFAT_SECTOR)
+            if need_fat == fat_cnt and need_difat == difat_cnt:
                 break
-            fat_cnt = needed
+            fat_cnt, difat_cnt = need_fat, need_difat
 
-        total_sectors = fat_cnt + mfat_cnt + dir_cnt + fat_size + mini_container_cnt
+        total_sectors = (difat_cnt + fat_cnt + mfat_cnt + dir_cnt
+                         + fat_size + mini_container_cnt)
 
-        # Build FAT
-        fat = [_FATSECT] * fat_cnt
-        i = fat_cnt
+        # Build FAT — sector layout:
+        # [DIFAT][FAT][MiniFAT][Directory][large streams][mini stream container]
+        fat = [_DIFSECT] * difat_cnt + [_FATSECT] * fat_cnt
+        i = difat_cnt + fat_cnt
 
         def chainit(count):
             nonlocal i
@@ -303,7 +339,7 @@ class _OleWriter:
                 continue
             e._start_sector = mi
             n_mini = (len(e.data) + 63) >> 6
-            for k in range(n_mini - 1):
+            for _ in range(n_mini - 1):
                 mini_fat.append(mi + 1)
                 mi += 1
             mini_fat.append(_ENDOFCHAIN)
@@ -314,22 +350,31 @@ class _OleWriter:
 
         # Build output
         buf = bytearray(_SECTOR_SIZE * (1 + total_sectors))
-        self._write_header(buf, fat_cnt, dir_start,
-                           fat_cnt if mfat_cnt > 0 else _ENDOFCHAIN, mfat_cnt)
+        self._write_header(buf, fat_cnt, difat_cnt, dir_start, mfat_cnt)
+
+        # DIFAT sectors: 127 FAT sector locations + chain pointer to next
+        for j in range(difat_cnt):
+            off = _SECTOR_SIZE * (1 + j)
+            for k in range(_ENTRIES_PER_DIFAT_SECTOR):
+                idx = _DIFAT_HEADER_ENTRIES + j * _ENTRIES_PER_DIFAT_SECTOR + k
+                struct.pack_into('<I', buf, off + k * 4,
+                                 difat_cnt + idx if idx < fat_cnt else _FREESECT)
+            struct.pack_into('<I', buf, off + _SECTOR_SIZE - 4,
+                             j + 1 if j + 1 < difat_cnt else _ENDOFCHAIN)
 
         for si in range(fat_cnt):
-            off = _SECTOR_SIZE * (1 + si)
+            off = _SECTOR_SIZE * (1 + difat_cnt + si)
             for j in range(_ENTRIES_PER_FAT_SECTOR):
                 struct.pack_into('<I', buf, off + j * 4,
                                 fat[si * _ENTRIES_PER_FAT_SECTOR + j] & 0xFFFFFFFF)
 
-        mfat_off = _SECTOR_SIZE * (1 + fat_cnt)
+        mfat_off = _SECTOR_SIZE * (1 + difat_cnt + fat_cnt)
         for j, v in enumerate(mini_fat):
             struct.pack_into('<I', buf, mfat_off + j * 4, v & 0xFFFFFFFF)
         for j in range(len(mini_fat), mfat_cnt * _ENTRIES_PER_FAT_SECTOR):
             struct.pack_into('<I', buf, mfat_off + j * 4, _FREESECT)
 
-        dir_off = _SECTOR_SIZE * (1 + fat_cnt + mfat_cnt)
+        dir_off = _SECTOR_SIZE * (1 + difat_cnt + fat_cnt + mfat_cnt)
         for idx, e in enumerate(entries):
             self._write_dir_entry(buf, dir_off + idx * _DIR_ENTRY_SIZE, e)
         for idx in range(len(entries), dir_cnt * 4):
@@ -338,12 +383,13 @@ class _OleWriter:
             struct.pack_into('<I', buf, off + 72, _NOSTREAM)
             struct.pack_into('<I', buf, off + 76, _NOSTREAM)
 
-        large_off = _SECTOR_SIZE * (1 + fat_cnt + mfat_cnt + dir_cnt)
+        data_base = difat_cnt + fat_cnt + mfat_cnt + dir_cnt
+        large_off = _SECTOR_SIZE * (1 + data_base)
         for e in large:
-            eoff = large_off + (e._start_sector - fat_cnt - mfat_cnt - dir_cnt) * _SECTOR_SIZE
+            eoff = large_off + (e._start_sector - data_base) * _SECTOR_SIZE
             buf[eoff:eoff + len(e.data)] = e.data
 
-        mini_off = _SECTOR_SIZE * (1 + fat_cnt + mfat_cnt + dir_cnt + fat_size)
+        mini_off = _SECTOR_SIZE * (1 + data_base + fat_size)
         for e in small:
             if not e.data:
                 continue
@@ -352,7 +398,7 @@ class _OleWriter:
 
         return bytes(buf)
 
-    def write(self, path: Union[str, Path]) -> None:
+    def write(self, path: str | Path) -> None:
         """Build and write the OLE compound file to disk."""
         Path(path).write_bytes(self.build())
 
@@ -374,7 +420,7 @@ class _OleWriter:
         rest = sorted(pairs[1:], key=lambda p: (len(p[0]), p[0].upper()))
         sorted_pairs = [root_pair] + rest
 
-        for idx, (p, e) in enumerate(sorted_pairs):
+        for idx, (_p, e) in enumerate(sorted_pairs):
             e._dir_id = idx
             e._left_id = _NOSTREAM
             e._right_id = _NOSTREAM
@@ -432,17 +478,15 @@ class _OleWriter:
         struct.pack_into('<I', buf, off + 72, entry._right_id & 0xFFFFFFFF)
         struct.pack_into('<I', buf, off + 76, entry._child_id & 0xFFFFFFFF)
         buf[off + 80:off + 96] = entry.clsid
-        if entry.entry_type in (_STGTY_STORAGE, _STGTY_ROOT):
-            ft = _filetime_now()
-            struct.pack_into('<Q', buf, off + 100, ft)
-            struct.pack_into('<Q', buf, off + 108, ft)
+        # Storage timestamps stay zero (MS-CFB: root times SHOULD be zero,
+        # storage times MAY be) — this also makes output deterministic.
         if entry.entry_type == _STGTY_ROOT:
             struct.pack_into('<I', buf, off + 116, entry._start_sector & 0xFFFFFFFF)
         elif entry.entry_type == _STGTY_STREAM:
             struct.pack_into('<I', buf, off + 116, entry._start_sector & 0xFFFFFFFF)
         struct.pack_into('<I', buf, off + 120, entry._data_size)
 
-    def _write_header(self, buf, fat_cnt, dir_start, mfat_start, mfat_cnt):
+    def _write_header(self, buf, fat_cnt, difat_cnt, dir_start, mfat_cnt):
         buf[0:8] = _MAGIC
         struct.pack_into('<H', buf, 24, 0x003E)
         struct.pack_into('<H', buf, 26, 0x0003)
@@ -452,12 +496,14 @@ class _OleWriter:
         struct.pack_into('<I', buf, 44, fat_cnt)
         struct.pack_into('<I', buf, 48, dir_start)
         struct.pack_into('<I', buf, 56, _MINI_STREAM_CUTOFF)
-        struct.pack_into('<I', buf, 60, mfat_start if mfat_cnt > 0 else _ENDOFCHAIN)
+        struct.pack_into('<I', buf, 60,
+                         difat_cnt + fat_cnt if mfat_cnt > 0 else _ENDOFCHAIN)
         struct.pack_into('<I', buf, 64, mfat_cnt)
-        struct.pack_into('<I', buf, 68, _ENDOFCHAIN)
-        struct.pack_into('<I', buf, 72, 0)
-        for i in range(109):
-            struct.pack_into('<I', buf, 76 + i * 4, i if i < fat_cnt else _FREESECT)
+        struct.pack_into('<I', buf, 68, 0 if difat_cnt > 0 else _ENDOFCHAIN)
+        struct.pack_into('<I', buf, 72, difat_cnt)
+        for i in range(_DIFAT_HEADER_ENTRIES):
+            struct.pack_into('<I', buf, 76 + i * 4,
+                             difat_cnt + i if i < fat_cnt else _FREESECT)
 
 
 # ─── MAPI Property helpers (internal) ───────────────────────────────────────
@@ -471,6 +517,9 @@ class _Props:
 
     def add_boolean(self, prop_id, value):
         self._entries.append((prop_id, _PT_BOOLEAN, 1 if value else 0))
+
+    def add_systime(self, prop_id, filetime):
+        self._entries.append((prop_id, _PT_SYSTIME, filetime))
 
     def add_unicode(self, ole, parent, prop_id, value):
         data = value.encode('utf-16-le')
@@ -499,7 +548,9 @@ class _Props:
             struct.pack_into('<H', entry, 0, prop_type)
             struct.pack_into('<H', entry, 2, prop_id)
             struct.pack_into('<I', entry, 4, 0x00000006)
-            if prop_type in (_PT_LONG, _PT_BOOLEAN):
+            if prop_type == _PT_SYSTIME:
+                struct.pack_into('<Q', entry, 8, value)
+            elif prop_type in (_PT_LONG, _PT_BOOLEAN):
                 struct.pack_into('<I', entry, 8, value & 0xFFFFFFFF)
             elif prop_type in (_PT_UNICODE, _PT_BINARY):
                 struct.pack_into('<I', entry, 8, value)
@@ -533,6 +584,17 @@ def _build_msg(msg: Message) -> bytes:
         mp.add_unicode(ole, root, 0x0037, msg.subject)  # Subject
         mp.add_unicode(ole, root, 0x0070, msg.subject)  # ConversationTopic
 
+    if msg.sender:
+        s_email, s_name = _normalize_recipients([msg.sender])[0]
+        mp.add_unicode(ole, root, 0x0C1A, s_name)    # SenderName
+        mp.add_unicode(ole, root, 0x0C1E, "SMTP")    # SenderAddrType
+        mp.add_unicode(ole, root, 0x0C1F, s_email)   # SenderEmailAddress
+        mp.add_unicode(ole, root, 0x5D01, s_email)   # SenderSmtpAddress
+        mp.add_unicode(ole, root, 0x0042, s_name)    # SentRepresentingName
+        mp.add_unicode(ole, root, 0x0064, "SMTP")    # SentRepresentingAddrType
+        mp.add_unicode(ole, root, 0x0065, s_email)   # SentRepresentingEmailAddress
+        mp.add_unicode(ole, root, 0x5D02, s_email)   # SentRepresentingSmtpAddress
+
     has_inline = any(cid for _, _, _, cid in msg._attachments)
     if msg.html_body:
         import compressed_rtf
@@ -542,6 +604,9 @@ def _build_msg(msg: Message) -> bytes:
         rtf_bytes = _encapsulate_html(html)
         mp.add_binary(ole, root, 0x1009, compressed_rtf.compress(rtf_bytes))
         mp.add_boolean(0x0E1F, True)  # RTF_IN_SYNC
+        # PidTagHtml with the original cid: references — Outlook renders the
+        # RTF above, but non-Outlook consumers get the HTML directly.
+        mp.add_binary(ole, root, 0x1013, msg.html_body.encode('utf-8'))
         mp.add_unicode(ole, root, 0x1000,
                        msg.text_body or _strip_html(msg.html_body))
     elif msg.text_body:
@@ -558,14 +623,24 @@ def _build_msg(msg: Message) -> bytes:
     if bcc_display:
         mp.add_unicode(ole, root, 0x0E02, bcc_display)
 
-    flags = 0x08  # MSGFLAG_UNSENT
+    flags = 0x01 if msg.sent else 0x08   # MSGFLAG_READ / MSGFLAG_UNSENT
     if msg._attachments:
         flags |= 0x10  # MSGFLAG_HASATTACH
     mp.add_long(0x0E07, flags)           # MessageFlags
+    if msg.sent:
+        ft = (_datetime_to_filetime(msg.sent)
+              if isinstance(msg.sent, datetime) else _filetime_now())
+        mp.add_systime(0x0039, ft)       # ClientSubmitTime
+        mp.add_systime(0x0E06, ft)       # MessageDeliveryTime
     mp.add_long(0x340D, 0x00040000)      # StoreSupportMask: STORE_UNICODE_OK
     mp.add_long(0x3FDE, 65001)           # InternetCodepage: UTF-8
     mp.add_long(0x3FF1, 0x0409)          # MessageLocaleId: en-US
-    imp, prio = _IMPORTANCE_MAP.get(msg.importance, (1, 0))
+    try:
+        imp, prio = _IMPORTANCE_MAP[msg.importance]
+    except KeyError:
+        raise ValueError(
+            f"importance must be one of {sorted(_IMPORTANCE_MAP)}, "
+            f"got {msg.importance!r}") from None
     mp.add_long(0x0017, imp)             # Importance
     mp.add_long(0x0026, prio)            # Priority
     mp.add_long(0x0036, 0)               # Sensitivity: none
@@ -612,7 +687,8 @@ def _build_msg(msg: Message) -> bytes:
             ap.add_long(0x3714, 0)              # AttachFlags: normal
         ap.add_unicode(ole, stor, 0x3704, short_name)   # AttachFilename
         ap.add_unicode(ole, stor, 0x3707, filename)     # AttachLongFilename
-        ap.add_unicode(ole, stor, 0x3703, ext)          # AttachExtension
+        if ext:  # zero-length PtypString streams are forbidden by the spec
+            ap.add_unicode(ole, stor, 0x3703, ext)      # AttachExtension
         ap.add_unicode(ole, stor, 0x3001, filename)     # DisplayName
         ap.add_binary(ole, stor, 0x3701, data)          # AttachDataBinary
         if mime_type:
@@ -639,10 +715,15 @@ def _encapsulate_html(html_str: str) -> bytes:
     for part in re.split(r'(<[^>]+>)', html_str):
         if not part:
             continue
+        # Collapse whitespace runs to a single space (HTML semantics; note
+        # this does not preserve <pre> content). Raw newlines are ignored by
+        # RTF readers and would otherwise glue adjacent words together, and
+        # whitespace-only runs between tags must survive as a space.
+        part = re.sub(r'\s+', ' ', part)
         encoded = _rtf_encode(part)
         if part.startswith('<'):
             out.append('{\\*\\htmltag ' + encoded + '}')
-        elif encoded.strip():
+        elif part:
             out.append(encoded)
 
     out.append('}')
@@ -686,10 +767,12 @@ def _rtf_encode(text: str) -> str:
 
 def _strip_html(html_str: str) -> str:
     """Strip HTML tags for plain text fallback."""
-    text = re.sub(r'<br\s*/?>', '\n', html_str)
-    text = re.sub(r'</p>', '\n', text)
-    text = re.sub(r'</tr>', '\n', text)
-    text = re.sub(r'</t[dh]>', '\t', text)
+    text = re.sub(r'(?is)<(script|style)\b[^>]*>.*?</\1\s*>', '', html_str)
+    text = re.sub(r'(?s)<!--.*?-->', '', text)
+    text = re.sub(r'(?i)<br\s*/?>', '\n', text)
+    text = re.sub(r'(?i)</p>', '\n', text)
+    text = re.sub(r'(?i)</tr>', '\n', text)
+    text = re.sub(r'(?i)</t[dh]>', '\t', text)
     text = re.sub(r'<[^>]+>', '', text)
     text = html_mod.unescape(text)
     return re.sub(r'\n{3,}', '\n\n', text).strip()
@@ -700,10 +783,15 @@ def _filetime_now() -> int:
     return int((time.time() + 11644473600) * 10_000_000)
 
 
+def _datetime_to_filetime(dt: datetime) -> int:
+    """Convert a datetime to Windows FILETIME (naive = local time)."""
+    return int((dt.timestamp() + 11644473600) * 10_000_000)
+
+
 def _inline_cid_images(html: str, attachments) -> str:
     """Replace cid: references with base64 data URIs."""
     import base64
-    for filename, data, mime_type, content_id in attachments:
+    for _filename, data, mime_type, content_id in attachments:
         if content_id:
             b64 = base64.b64encode(data).decode('ascii')
             html = html.replace(
